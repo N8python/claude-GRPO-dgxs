@@ -264,6 +264,61 @@ Two things differ from the 1B and are worth knowing before you scale up:
    `--prompts-per-step`, or shape the reward (exact-match bonus, short-word
    curriculum), if you rerun.
 
+## Results: gemma-4-E4B (7.96B) — a saturated task
+
+Ran the pipeline on `google/gemma-4-E4B-it` to exercise it at a size where
+generation genuinely dominates. **Rollouts hit 573 tok/s at 32-concurrent**
+(4×8 in 7.69 s, ±0.01). For reference, MLX on the same model and hardware ran
+~120–150 tok/s — roughly 4×, though not strictly like-for-like: these
+completions are ~138 tokens where that workload ran ~1,100–1,500, and decode
+slows as KV grows.
+
+| stage | exact | avg lev | tag |
+|---|---|---|---|
+| base, zero-shot (greedy) | **81.0%** | 0.43 | 99.8% |
+| + SFT, 100 traces (greedy) | **90.2%** | 0.17 | 100% |
+| + SFT (temp 0.7) | 88.3% | 0.22 | 100% |
+
+**GRPO was abandoned after 30 steps: the task is saturated for this model.**
+Base zero-shot is already 81% — it can reverse words natively, so SFT only
+teaches formatting. At P=4 G=16, `kept_groups` ran **0–2 of 4, ~75% dead**,
+with rollout `exact_rate` 0.81–0.98.
+
+The generalisable lesson is about *why* raising the group size didn't rescue
+it. Estimating dead groups as `p^G` from aggregate accuracy is wrong, because
+per-word accuracy is **bimodal**, not uniform: the model gets easy words right
+every single time, so those groups come back all-correct at any G. Bigger
+groups only help words near the decision boundary, and a saturated task has
+few of those. Predicted ~14% dead at G=16; measured ~75%.
+
+If you want RL signal from a model this strong, fix the *data*, not the group
+size — train on the subset the SFT policy actually fails (the
+`comp-train-hard` trick), shape the reward, or pick a harder task.
+
+### Two portability bugs this exposed
+
+Both were latent, not Gemma-specific:
+
+1. Bob built its LoRA-target list as `model.layers.{i}.{k}` from a config.
+   Gemma stores text weights under `language_model.model.…`, so that matched
+   nothing. Targets are now read from the **checkpoint's own keys**, which is
+   prefix- and architecture-agnostic.
+2. Bob discovered **294** targets against the trainer's **258**. Gemma 4 shares
+   KV across layers, so `k_proj`/`v_proj` are stored for all 42 layers but only
+   instantiated on 24. Bob now merges the intersection — an un-adapted linear's
+   merged value *is* its base value, so skipping is correct, not merely
+   tolerant — prunes the rest from the snapshot, and still errors hard on the
+   reverse gap, where an adapted linear with no base entry would silently never
+   reach the sampler.
+
+Also note: a local converted copy of this model can be **unloadable by
+transformers while working fine in vLLM**. `~/Documents/gemmaCEV/gemma-4-E4B-it`
+stores `language_model.model.*` where transformers 5.11 builds
+`model.language_model.*`, with no conversion mapping — `lm_head` and
+`embed_tokens` come up randomly initialised and generation is gibberish, with
+only a warning. vLLM's loader is tolerant enough not to care. Use the canonical
+`google/gemma-4-E4B-it`, and treat a coherence check as part of bring-up.
+
 ### Weight-sync cost, and where it actually goes
 
 `sync_s` rose 0.3 → ~1.2 s going from 1B to 4B, which looks like a transfer
@@ -425,5 +480,6 @@ handle.
 | `lora_torch.py` | both | hand-rolled LoRA keyed by HF checkpoint names |
 | `mlx_adamw.py` | Alice | AdamW matching MLX's, incl. `bias_correction=False` |
 | `bench_rollout.py` | Alice | generation throughput in a GRPO-shaped workload |
+| `run_grpo.sh` | Alice | generic GRPO run + evals (`M=… ADAPTER=… OUT=… G=…`) |
 | `rollout_client.py` | Alice | HTTP client |
 | `task.py`, `make_dataset.py`, `data/` | — | verbatim from the reference, so the eval set stays byte-identical |

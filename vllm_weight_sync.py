@@ -103,8 +103,36 @@ class WeightSyncWorkerExtension:
         dev = self._base_device
         count = [0]
 
+        # The checkpoint can contain LoRA-shaped weights the trainer never
+        # adapts. Gemma 4 shares KV across layers: k_proj/v_proj are stored for
+        # all 42 layers but only 24 are instantiated as modules, so Bob
+        # discovers 294 targets against Alice's 258. An un-adapted linear's
+        # merged value is just its base value, which the live model already
+        # holds, so skipping it is correct rather than merely tolerant.
+        matched = {n for n in self._base
+                   if f"{n[: -len('.weight')]}.lora_a" in lora}
+        if not matched:
+            raise RuntimeError(
+                f"none of {len(self._base)} base targets matched the {len(lora)} "
+                f"adapter tensors -- name conventions disagree between trainer "
+                f"and server. Base e.g. {sorted(self._base)[:1]}, adapter e.g. "
+                f"{sorted(lora)[:1]}"
+            )
+        # The reverse gap is a real bug, not a benign one: an adapted linear
+        # with no base entry would silently never be merged.
+        orphans = {k[: -len(".lora_a")] for k in lora if k.endswith(".lora_a")} - {
+            n[: -len(".weight")] for n in self._base
+        }
+        if orphans:
+            raise RuntimeError(
+                f"{len(orphans)} adapter tensors have no matching base weight, "
+                f"e.g. {sorted(orphans)[:3]} -- they would never reach the "
+                f"sampler while the trainer kept optimising them"
+            )
+
         def merged():
-            for name, w0 in self._base.items():
+            for name in matched:
+                w0 = self._base[name]
                 key = name[: -len(".weight")]
                 a = lora.get(f"{key}.lora_a")
                 b = lora.get(f"{key}.lora_b")
@@ -135,6 +163,14 @@ class WeightSyncWorkerExtension:
         loaded = model.load_weights(merged())
         self._sync_count += 1
 
+        # Drop base tensors the adapter never touches; on a 4B that is real
+        # memory sitting idle for the life of the server.
+        if self._sync_count == 1 and len(matched) < len(self._base):
+            skipped = len(self._base) - len(matched)
+            self._base = {n: w for n, w in self._base.items() if n in matched}
+            print(f"[sync] {skipped} base targets are not adapted by the "
+                  f"trainer; pruned from the snapshot", flush=True)
+
         # First sync doubles as a wiring check: if the HF->vLLM name mapping
         # were wrong, load_weights would quietly load nothing and the policy
         # would sample from the un-updated base forever.
@@ -145,7 +181,8 @@ class WeightSyncWorkerExtension:
                     f"load_weights accepted 0 of {count[0]} tensors -- the "
                     f"HF->vLLM parameter name mapping is wrong for this arch"
                 )
-            return {"merged": count[0], "loaded": n, "fp32_merge": fp32_merge}
+            return {"merged": count[0], "loaded": n, "fp32_merge": fp32_merge,
+                    "base_targets": len(self._base)}
         return {"merged": count[0]}
 
     def reset_to_base(self):

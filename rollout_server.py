@@ -274,20 +274,53 @@ def _invalidate_caches(llm):
                       f"{ENGINE['prefix_caching']}", flush=True)
 
 
+def _discover_targets(model_id: str):
+    """LoRA-target module names, read from the checkpoint itself.
+
+    Deliberately not constructed as f"model.layers.{i}.{k}" from a config:
+    checkpoint prefixes vary by architecture. Gemma4 is a
+    ``Gemma4ForConditionalGeneration`` whose text weights live under
+    ``language_model.model.layers.…``, so a synthesised name would match
+    nothing, the base snapshot would come up empty, and the failure would look
+    like a missing-weights error a long way from its cause. Reading the actual
+    keys makes this prefix-agnostic.
+    """
+    import glob as _glob
+
+    from vllm_weight_sync import _resolve_model_dir
+    from lora_torch import LORA_KEYS
+
+    d = _resolve_model_dir(model_id)
+    keys = []
+    index = _glob.glob(os.path.join(d, "*.index.json"))
+    if index:
+        keys = list(json.load(open(index[0]))["weight_map"])
+    else:
+        from safetensors import safe_open
+
+        for shard in sorted(_glob.glob(os.path.join(d, "*.safetensors"))):
+            with safe_open(shard, "pt") as f:
+                keys += list(f.keys())
+
+    targets = sorted(
+        k[: -len(".weight")]
+        for k in keys
+        if k.endswith(".weight")
+        and any(k[: -len(".weight")].endswith(t) for t in LORA_KEYS)
+    )
+    if not targets:
+        raise SystemExit(
+            f"no LoRA-target weights found in {d}; expected names ending in "
+            f"one of {LORA_KEYS}"
+        )
+    return targets
+
+
 def build_engine(args):
     import vllm
     from vllm import LLM
-    from transformers import AutoConfig
 
-    # Derive the LoRA-target module list from the config rather than hardcoding
-    # a layer count, so a different base model doesn't silently sync a subset.
-    from lora_torch import LORA_KEYS
-
-    cfg = AutoConfig.from_pretrained(args.model)
-    n_layers = cfg.num_hidden_layers
-    targets = [
-        f"model.layers.{i}.{k}" for i in range(n_layers) for k in LORA_KEYS
-    ]
+    targets = _discover_targets(args.model)
 
     kwargs = dict(
         model=args.model,
@@ -301,6 +334,11 @@ def build_engine(args):
         worker_extension_cls="vllm_weight_sync.WeightSyncWorkerExtension",
         logprobs_mode=args.logprobs_mode,
     )
+    if args.hf_overrides:
+        # e.g. '{"architectures":["Gemma4ForCausalLM"]}' — a multimodal
+        # checkpoint whose local dir has no preprocessor_config.json crashes
+        # the processor load, and we only ever want the text tower anyway.
+        kwargs["hf_overrides"] = json.loads(args.hf_overrides)
     if args.enable_lora:
         # Native-LoRA mode: vLLM applies the adapter with punica kernels at
         # decode time instead of us folding it into the weights. No base
@@ -341,7 +379,7 @@ def build_engine(args):
     ENGINE["top_k_off"], ENGINE["logprobs_arg"] = _probe_sampling_sentinels()
     print(
         f"[bob] vLLM {ENGINE['vllm_version']} ready: {args.model} "
-        f"({n_layers} layers, {len(targets)} sync targets), "
+        f"({len(targets)} sync targets), "
         f"logprobs_mode={args.logprobs_mode}, "
         f"prefix_caching={args.enable_prefix_caching}, "
         f"weight_mode={'vllm-lora' if args.enable_lora else ('merge-fp32' if args.fp32_merge else 'merge-addmm')}",
@@ -389,6 +427,10 @@ def main():
     ap.add_argument("--logprobs-mode", default="processed_logprobs",
                     help="MUST stay processed_* for TIS: the behavior policy "
                     "is the post-temperature, post-truncation distribution")
+    ap.add_argument("--hf-overrides", default=None,
+                    help="JSON passed to vLLM's hf_overrides, e.g. "
+                    "'{\"architectures\":[\"Gemma4ForCausalLM\"]}' to load a "
+                    "multimodal checkpoint text-only")
     ap.add_argument("--enable-lora", action="store_true",
                     help="serve the adapter through vLLM's native LoRA runtime "
                     "instead of merging it into the weights. Skips the base "
