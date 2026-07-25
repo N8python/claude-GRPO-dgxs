@@ -1,0 +1,12 @@
+# trained artifacts — regenerate with train_sft.py / train_grpo.py
+models/
+
+# run outputs
+logs/
+*.log
+preds_*.jsonl
+wandb/
+
+__pycache__/
+*.py[cod]
+.DS_Store
