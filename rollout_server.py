@@ -20,6 +20,8 @@ Launch via launch_bob.sh.
 """
 
 import argparse
+import json
+import os
 import threading
 import time
 
@@ -74,6 +76,8 @@ def info():
         "max_model_len": ENGINE["max_model_len"],
         "weight_version": ENGINE["weight_version"],
         "lora_synced": ENGINE["lora_synced"],
+        "weight_mode": "vllm-lora" if ENGINE["lora_mode"]
+                       else ("merge-fp32" if ENGINE["fp32_merge"] else "merge-addmm"),
         "vllm_version": ENGINE["vllm_version"],
     }
 
@@ -97,7 +101,10 @@ def generate(req: GenerateRequest):
 
     t0 = time.time()
     with LOCK:
-        outs = ENGINE["llm"].generate(prompts, params, use_tqdm=False)
+        kw = {}
+        if ENGINE["lora_mode"] and ENGINE.get("lora_request") is not None:
+            kw["lora_request"] = ENGINE["lora_request"]
+        outs = ENGINE["llm"].generate(prompts, params, use_tqdm=False, **kw)
     dt = time.time() - t0
 
     # Flatten group-major: result index p*n + k is sample k of prompt p, which
@@ -141,6 +148,15 @@ async def update_weights(request: Request, scale: float, step: int = -1):
         raise HTTPException(400, "empty weight payload")
 
     t0 = time.time()
+    if ENGINE["lora_mode"]:
+        with LOCK:
+            detail = _install_lora_adapter(payload, scale)
+            ENGINE["weight_version"] += 1
+        return {
+            "weight_version": ENGINE["weight_version"], "step": step,
+            "bytes": len(payload), "seconds": time.time() - t0, "detail": detail,
+        }
+
     with LOCK:
         llm = ENGINE["llm"]
         if not ENGINE["lora_synced"]:
@@ -156,7 +172,9 @@ async def update_weights(request: Request, scale: float, step: int = -1):
             print(f"[sync] base snapshot: {res[0]}", flush=True)
 
         res = llm.collective_rpc(
-            "apply_lora_update", kwargs=dict(payload=payload, scale=scale)
+            "apply_lora_update",
+            kwargs=dict(payload=payload, scale=scale,
+                        fp32_merge=ENGINE["fp32_merge"]),
         )
         _invalidate_caches(llm)
         ENGINE["weight_version"] += 1
@@ -170,13 +188,66 @@ async def update_weights(request: Request, scale: float, step: int = -1):
     }
 
 
+def _install_lora_adapter(payload: bytes, scale: float):
+    """Write the LoRA out in PEFT layout and point vLLM's adapter slot at it.
+
+    vLLM 0.23's LoRARequest asserts a non-empty ``lora_path`` -- there is no
+    in-memory tensor route -- so the adapter has to round-trip through a
+    filesystem. It goes to tmpfs (/dev/shm) so that "disk" is RAM.
+
+    ``load_inplace=True`` lets the same lora_int_id be reloaded every step,
+    which is what makes this viable at all: without it, defeating the adapter
+    cache would mean minting a fresh id per step and leaking slots.
+    """
+    from safetensors.torch import load as load_bytes, save_file
+    from vllm.lora.request import LoRARequest
+
+    lora = load_bytes(payload)
+    path = ENGINE["lora_dir"]
+    os.makedirs(path, exist_ok=True)
+
+    tensors, targets, rank = {}, set(), None
+    for k, v in lora.items():
+        base, suffix = k.rsplit(".", 1)
+        if suffix not in ("lora_a", "lora_b"):
+            raise HTTPException(400, f"unexpected adapter key {k}")
+        # vLLM strips `base_model.model.` then drops the trailing
+        # `lora_A/lora_B` + `weight`, leaving the vLLM module path.
+        ab = "lora_A" if suffix == "lora_a" else "lora_B"
+        tensors[f"base_model.model.{base}.{ab}.weight"] = v.contiguous()
+        targets.add(base.split(".")[-1])
+        if suffix == "lora_a":
+            rank = v.shape[0]
+
+    # PEFT expresses the scale as lora_alpha / r; ours arrives pre-divided.
+    json.dump(
+        {
+            "peft_type": "LORA", "task_type": "CAUSAL_LM", "r": rank,
+            "lora_alpha": scale * rank, "lora_dropout": 0.0, "bias": "none",
+            "target_modules": sorted(targets), "use_rslora": False,
+            "use_dora": False,
+        },
+        open(os.path.join(path, "adapter_config.json"), "w"),
+    )
+    save_file(tensors, os.path.join(path, "adapter_model.safetensors"))
+
+    ENGINE["lora_request"] = LoRARequest(
+        lora_name="policy", lora_int_id=1, lora_path=path, load_inplace=True
+    )
+    return {"rank": rank, "targets": len(targets), "tensors": len(tensors),
+            "path": path}
+
+
 @app.post("/reset_weights")
 def reset_weights():
     with LOCK:
         llm = ENGINE["llm"]
-        if not ENGINE["lora_synced"]:
-            raise HTTPException(409, "no weights have been pushed; already at base")
-        llm.collective_rpc("reset_to_base")
+        if ENGINE["lora_mode"]:
+            ENGINE["lora_request"] = None  # generate() then runs the base model
+        else:
+            if not ENGINE["lora_synced"]:
+                raise HTTPException(409, "no weights have been pushed; already at base")
+            llm.collective_rpc("reset_to_base")
         _invalidate_caches(llm)
         ENGINE["weight_version"] += 1
     return {"weight_version": ENGINE["weight_version"], "at_base": True}
@@ -230,6 +301,14 @@ def build_engine(args):
         worker_extension_cls="vllm_weight_sync.WeightSyncWorkerExtension",
         logprobs_mode=args.logprobs_mode,
     )
+    if args.enable_lora:
+        # Native-LoRA mode: vLLM applies the adapter with punica kernels at
+        # decode time instead of us folding it into the weights. No base
+        # snapshot is needed (saves ~7.3 GB on a 4B) and updates are a file
+        # write rather than a full-model rewrite -- paid back as per-token
+        # decode overhead.
+        kwargs.update(enable_lora=True, max_loras=1,
+                      max_lora_rank=args.max_lora_rank)
     try:
         llm = LLM(**kwargs)
     except TypeError as e:
@@ -253,6 +332,10 @@ def build_engine(args):
         max_model_len=args.max_model_len,
         weight_version=0,
         lora_synced=False,
+        fp32_merge=args.fp32_merge,
+        lora_mode=args.enable_lora,
+        lora_dir=args.lora_dir,
+        lora_request=None,
         vllm_version=getattr(vllm, "__version__", "unknown"),
     )
     ENGINE["top_k_off"], ENGINE["logprobs_arg"] = _probe_sampling_sentinels()
@@ -260,7 +343,8 @@ def build_engine(args):
         f"[bob] vLLM {ENGINE['vllm_version']} ready: {args.model} "
         f"({n_layers} layers, {len(targets)} sync targets), "
         f"logprobs_mode={args.logprobs_mode}, "
-        f"prefix_caching={args.enable_prefix_caching}",
+        f"prefix_caching={args.enable_prefix_caching}, "
+        f"weight_mode={'vllm-lora' if args.enable_lora else ('merge-fp32' if args.fp32_merge else 'merge-addmm')}",
         flush=True,
     )
 
@@ -305,6 +389,21 @@ def main():
     ap.add_argument("--logprobs-mode", default="processed_logprobs",
                     help="MUST stay processed_* for TIS: the behavior policy "
                     "is the post-temperature, post-truncation distribution")
+    ap.add_argument("--enable-lora", action="store_true",
+                    help="serve the adapter through vLLM's native LoRA runtime "
+                    "instead of merging it into the weights. Skips the base "
+                    "snapshot and makes updates a file write, at the cost of "
+                    "punica overhead on every generated token")
+    ap.add_argument("--max-lora-rank", type=int, default=16,
+                    help="must be >= the adapter's rank")
+    ap.add_argument("--lora-dir", default="/dev/shm/dgxgrpo_lora",
+                    help="where the PEFT adapter is staged for vLLM to read; "
+                    "tmpfs by default so the round-trip stays in RAM")
+    ap.add_argument("--fp32-merge", action="store_true",
+                    help="merge in fp32 via mm+mul+add+cast (the original "
+                    "path). Escape hatch: the default fused addmm rounds A/B "
+                    "to bf16 before the GEMM, which check_sync should confirm "
+                    "is invisible -- use this if it is not")
     ap.add_argument("--base-device", default="cuda",
                     help="where Bob parks the pristine base snapshot (~2 GB "
                     "for a 1B); 'cpu' if you are tight on the vLLM pool")

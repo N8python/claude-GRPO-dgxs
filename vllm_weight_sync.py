@@ -91,7 +91,7 @@ class WeightSyncWorkerExtension:
         nbytes = sum(t.numel() * t.element_size() for t in base.values())
         return {"tensors": len(base), "bytes": nbytes, "dtype": str(dtype)}
 
-    def apply_lora_update(self, payload: bytes, scale: float):
+    def apply_lora_update(self, payload: bytes, scale: float, fp32_merge: bool = False):
         """Merge A/B into the base snapshot and write into the live model."""
         from safetensors.torch import load as load_bytes
 
@@ -100,20 +100,39 @@ class WeightSyncWorkerExtension:
 
         lora = load_bytes(payload)
         model = self._model()
-        merged = []
-        for name, w0 in self._base.items():
-            key = name[: -len(".weight")]
-            a = lora.get(f"{key}.lora_a")
-            b = lora.get(f"{key}.lora_b")
-            if a is None or b is None:
-                raise RuntimeError(f"LoRA payload has no A/B for {key}")
-            delta = torch.mm(
-                b.to(self._base_device, torch.float32),
-                a.to(self._base_device, torch.float32),
-            ).mul_(scale)
-            merged.append((name, delta.add_(w0.float()).to(w0.dtype)))
+        dev = self._base_device
+        count = [0]
 
-        loaded = model.load_weights(merged)
+        def merged():
+            for name, w0 in self._base.items():
+                key = name[: -len(".weight")]
+                a = lora.get(f"{key}.lora_a")
+                b = lora.get(f"{key}.lora_b")
+                if a is None or b is None:
+                    raise RuntimeError(f"LoRA payload has no A/B for {key}")
+                if fp32_merge:
+                    delta = torch.mm(
+                        b.to(dev, torch.float32), a.to(dev, torch.float32)
+                    ).mul_(scale)
+                    out = delta.add_(w0.float()).to(w0.dtype)
+                else:
+                    # One fused pass instead of ~5 full-size fp32 intermediates:
+                    # ~15 GB of traffic rather than ~130 GB. cuBLAS accumulates
+                    # bf16 GEMMs in fp32 and alpha applies inside that
+                    # accumulator, so the rank-r sum and the scale stay fp32 --
+                    # only the A/B inputs and the single output rounding are
+                    # bf16. Measured on Qwen3-4B: 0.73 s -> see README.
+                    out = torch.addmm(
+                        w0, b.to(dev, w0.dtype), a.to(dev, w0.dtype),
+                        beta=1.0, alpha=scale,
+                    )
+                count[0] += 1
+                yield name, out
+
+        # A generator, not a list: load_weights consumes lazily, so each merged
+        # tensor is freed after its copy instead of holding the whole model
+        # (7.3 GB on a 4B) resident alongside the base snapshot.
+        loaded = model.load_weights(merged())
         self._sync_count += 1
 
         # First sync doubles as a wiring check: if the HF->vLLM name mapping
@@ -123,11 +142,11 @@ class WeightSyncWorkerExtension:
             n = len(loaded) if loaded is not None else None
             if n == 0:
                 raise RuntimeError(
-                    f"load_weights accepted 0 of {len(merged)} tensors -- the "
+                    f"load_weights accepted 0 of {count[0]} tensors -- the "
                     f"HF->vLLM parameter name mapping is wrong for this arch"
                 )
-            return {"merged": len(merged), "loaded": n}
-        return {"merged": len(merged)}
+            return {"merged": count[0], "loaded": n, "fp32_merge": fp32_merge}
+        return {"merged": count[0]}
 
     def reset_to_base(self):
         """Write the pristine base snapshot back into the live model."""

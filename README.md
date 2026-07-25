@@ -264,9 +264,32 @@ Two things differ from the 1B and are worth knowing before you scale up:
    `--prompts-per-step`, or shape the reward (exact-match bonus, short-word
    curriculum), if you rerun.
 
-`sync_s` also rose 0.3 → ~1.3 s (12% of the step): 66 MB of rank-8 LoRA in fp32
-plus a 7.3 GB base re-merge per push. Both are reducible — bf16 on the wire
-would halve the transfer — and neither is optimized.
+### Weight-sync cost, and where it actually goes
+
+`sync_s` rose 0.3 → ~1.2 s going from 1B to 4B, which looks like a transfer
+problem and is not. Profiled on Qwen3-4B:
+
+| phase | fp32 merge | fused `addmm` |
+|---|---|---|
+| `lora_state_dict` (GPU→CPU) | 0.001 s | 0.001 s |
+| safetensors serialize | 0.054 s | 0.058 s |
+| wire + HTTP (66 MB) | 0.068 s | 0.060 s |
+| **merge on Bob (server-side)** | **0.73 s** | **0.36 s** |
+| total | 0.85 s | **0.48 s** |
+
+The wire is 8% of it. The cost is that a push rewrites the whole merged weight,
+so it scales with **model size**, not payload or LoRA rank — which is why it
+tripled from 1B to 4B while the payload only tripled in a much smaller number.
+
+The original expression materialized ~5 full-size fp32 intermediates
+(`mm` → `mul_` → `w0.float()` → `add_` → cast) ≈ 130 GB of traffic against
+GB10's 273 GB/s. Folding it into one `torch.addmm(w0, b, a, alpha=scale)` makes
+it a single pass (~15 GB), and streaming through a generator instead of a list
+keeps the merged model from being resident alongside the base snapshot.
+cuBLAS accumulates bf16 GEMMs in fp32 and `alpha` applies inside that
+accumulator, so only the A/B inputs and the one output rounding are bf16 —
+`dlogp` went 0.00167 → 0.00129, i.e. no regression. `--fp32-merge` restores
+the old path.
 
 Health metrics held for all 300 steps in both arms. `dlogp` median 0.0013
 (strict) / 0.0012 (async), max ~0.003 — the weight sync never degraded across
