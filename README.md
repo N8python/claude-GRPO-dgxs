@@ -291,6 +291,35 @@ accumulator, so only the A/B inputs and the one output rounding are bf16 —
 `dlogp` went 0.00167 → 0.00129, i.e. no regression. `--fp32-merge` restores
 the old path.
 
+### Merging vs vLLM's native LoRA runtime (`--enable-lora`)
+
+Both are implemented; measure before choosing. `--enable-lora` skips the base
+snapshot entirely and makes a push a file write instead of a full-model
+rewrite, at the cost of punica kernels on every generated token. Benchmarked
+head-to-head on Qwen3-4B with `bench_rollout.py`, 4×8 completions:
+
+| | `merge-addmm` (default) | `--enable-lora` |
+|---|---|---|
+| sync, per step | 0.48 s | **0.15 s** |
+| rollout, 4×8 | **14.35 s** (299 tok/s) | 27.63 s (155 tok/s) |
+| **step total** | **14.83 s** | 27.78 s |
+| `dlogp` | 0.00129 | 0.00150 |
+| first push (one-time) | 46.9 s (base snapshot) | 0.15 s |
+| extra GPU memory | ~7.3 GB snapshot | none |
+
+**Merging wins by 1.87× on this hardware.** Punica roughly halves decode
+throughput on GB10, and since generation dominates a 4B step, that swamps the
+10× sync saving — LoRA mode saves 0.33 s and spends 13.3 s to do it. Note the
+startup warning `Using default LoRA kernel configs`: punica has no tuned
+configs for sm_121, so this gap may be much smaller on a better-supported
+arch. Re-measure rather than inheriting this conclusion.
+
+Both modes agree with the trainer equally well (`dlogp` ~0.0013–0.0015), so
+this is purely a throughput decision. vLLM 0.23's `LoRARequest` asserts a
+non-empty `lora_path` — there is no in-memory tensor route — so LoRA mode
+stages the adapter in `/dev/shm` and relies on `load_inplace=True` to reload
+the same `lora_int_id` each step.
+
 Health metrics held for all 300 steps in both arms. `dlogp` median 0.0013
 (strict) / 0.0012 (async), max ~0.003 — the weight sync never degraded across
 300 pushes, and the staleness is invisible in the mean. It shows up only in the
@@ -395,5 +424,6 @@ handle.
 | `evaluate.py` | Alice | eval via Bob; never loads the model locally |
 | `lora_torch.py` | both | hand-rolled LoRA keyed by HF checkpoint names |
 | `mlx_adamw.py` | Alice | AdamW matching MLX's, incl. `bias_correction=False` |
+| `bench_rollout.py` | Alice | generation throughput in a GRPO-shaped workload |
 | `rollout_client.py` | Alice | HTTP client |
 | `task.py`, `make_dataset.py`, `data/` | — | verbatim from the reference, so the eval set stays byte-identical |
