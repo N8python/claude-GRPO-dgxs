@@ -6,14 +6,35 @@ is available). Reached from the server process with ``collective_rpc``.
 
 Why merge instead of using vLLM's native LoRA runtime:
 
-  * The trainer must sample from *exactly* the weights it is about to
-    differentiate. A merged weight is unambiguous; a punica-kernel LoRA path
-    is a second numerical path to reconcile.
-  * Hot-swapping an adapter every optimizer step means a fresh lora_int_id
-    every step to defeat the adapter cache, which grows without bound.
-  * Only ~22 MB crosses the wire either way (rank-8 A/B), because the merge
-    happens here against a pristine base snapshot Bob holds locally. Sending
-    merged weights instead would be ~2 GB per step.
+  * ``load_weights`` is the same code path for a merged LoRA and for a full
+    fine-tune. vLLM's LoRA runtime only ever handles LoRA, so it is a dead end
+    the moment you want full-parameter GRPO.
+  * ``load_weights`` has been a stable API for years; the LoRA runtime has
+    churned considerably across vLLM versions.
+  * No punica kernels in the decode path, so generation runs at base speed.
+  * Hot-swapping an adapter every optimizer step means minting a fresh
+    lora_int_id each step to defeat the adapter cache. (Weaker than it looks:
+    older vLLM required a filesystem path for LoRARequest, which would mean
+    writing the adapter to disk every step, but newer versions accept tensors
+    directly. Not re-checked against 0.23.0.)
+
+NOT a reason, despite an earlier version of this comment saying so: that
+merging is somehow numerically cleaner. It is not. The trainer keeps base and
+LoRA as *separate* branches (``base(x) + scale * (x @ A.T) @ B.T``), which is
+structurally what vLLM's LoRA path also computes. Merging is the side that
+introduces a distinct math path -- folding the low-rank term into the weight
+matrix and rounding to bf16 before the GEMM. It measures fine in practice
+(dlogp ~0.0013, median 0), but "fine" is not "better", and the comparison was
+never run.
+
+The honest cost of this choice: Bob holds a pristine base snapshot (~2 GB for
+a 1B, ~7.3 GB for a 4B) that the LoRA runtime would not need, and every push
+rewrites the full merged weight. Profiled on Qwen3-4B, a sync is 0.85 s of
+which 0.73 s is this merge and only 0.068 s is the 66 MB crossing the wire --
+the expression below materializes ~5 full-size fp32 intermediates, ~130 GB of
+memory traffic against 273 GB/s. That is self-inflicted, not inherent: folding
+it into a single ``torch.addmm`` with the scale pushed onto B would cut it to
+one pass (~15 GB). Worth doing before blaming the interconnect.
 
 The merged tensors are handed to ``model.load_weights()`` rather than poked
 into parameters by hand: vLLM fuses q/k/v into ``qkv_proj`` and gate/up into
